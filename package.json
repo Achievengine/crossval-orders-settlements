@@ -1,0 +1,38 @@
+{
+  "name": "crossval-orders-settlements",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "dev:worker": "wrangler dev",
+    "build": "tsc -b && vite build",
+    "typecheck": "tsc -b --pretty false",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "cf-typegen": "wrangler types",
+    "db:migrate:local": "wrangler d1 migrations apply crossval-orders-settlements-db --local",
+    "db:migrate:remote": "wrangler d1 migrations apply crossval-orders-settlements-db --remote",
+    "deploy": "npm run build && wrangler deploy"
+  },
+  "dependencies": {
+    "hono": "^4.9.2",
+    "lucide-react": "^1.31.0",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1",
+    "react-router-dom": "^7.8.1",
+    "zod": "^4.0.17"
+  },
+  "devDependencies": {
+    "@cloudflare/vite-plugin": "^1.52.1",
+    "@cloudflare/vitest-pool-workers": "^0.21.3",
+    "@cloudflare/workers-types": "^5.20260814.1",
+    "@types/react": "^19.1.10",
+    "@types/react-dom": "^19.1.7",
+    "@vitejs/plugin-react": "^5.0.2",
+    "typescript": "^5.9.2",
+    "vite": "^7.1.2",
+    "vitest": "^4.1.0",
+    "wrangler": "^4.123.0"
+  }
+}
