@@ -5,6 +5,8 @@ import {
   ChevronRight,
   CircleDollarSign,
   Download,
+  Eye,
+  EyeOff,
   LogOut,
   PlayCircle,
   Plus,
@@ -22,6 +24,7 @@ import {
 } from "react-router-dom";
 
 import { ORDER_STATUSES, type OrderStatus } from "../shared/domain";
+import { PASSWORD_MAX_LENGTH, PASSWORD_MIN_LENGTH, assessPassword } from "../shared/password";
 import { ApiError, apiRequest } from "./api";
 import type { OrderDetail, OrderSummary, User } from "./types";
 
@@ -88,12 +91,24 @@ function AuthPage({ onAuthenticated }: { onAuthenticated: (user: User) => void }
   const [mode, setMode] = useState<AuthMode>("login");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [passwordVisible, setPasswordVisible] = useState(false);
   const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const passwordAssessment = assessPassword(password);
+
+  function changeMode(nextMode: AuthMode) {
+    setMode(nextMode);
+    setPasswordVisible(false);
+    setError("");
+  }
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setError("");
+    if (mode === "signup" && !passwordAssessment.meetsMinimum) {
+      setError(`Password must contain ${PASSWORD_MIN_LENGTH} to ${PASSWORD_MAX_LENGTH} characters.`);
+      return;
+    }
     setSubmitting(true);
     try {
       const result = await apiRequest<{ user: User }>(`/api/auth/${mode}`, {
@@ -121,8 +136,8 @@ function AuthPage({ onAuthenticated }: { onAuthenticated: (user: User) => void }
       <section className="auth-form-panel" aria-label={`${mode === "login" ? "Log in" : "Create account"} form`}>
         <div className="auth-form-wrap">
           <div className="segmented-control" aria-label="Authentication mode">
-            <button type="button" aria-pressed={mode === "login"} onClick={() => setMode("login")}>Log in</button>
-            <button type="button" aria-pressed={mode === "signup"} onClick={() => setMode("signup")}>Sign up</button>
+            <button type="button" aria-pressed={mode === "login"} onClick={() => changeMode("login")}>Log in</button>
+            <button type="button" aria-pressed={mode === "signup"} onClick={() => changeMode("signup")}>Sign up</button>
           </div>
           <div className="form-heading">
             <h2>{mode === "login" ? "Welcome back" : "Create your workspace"}</h2>
@@ -135,18 +150,61 @@ function AuthPage({ onAuthenticated }: { onAuthenticated: (user: User) => void }
             </label>
             <label>
               Password
-              <input
-                type="password"
-                name="password"
-                autoComplete={mode === "login" ? "current-password" : "new-password"}
-                minLength={8}
-                value={password}
-                onChange={(event) => setPassword(event.target.value)}
-                required
-              />
+              <span className="password-field">
+                <input
+                  type={passwordVisible ? "text" : "password"}
+                  name="password"
+                  autoComplete={mode === "login" ? "current-password" : "new-password"}
+                  minLength={PASSWORD_MIN_LENGTH}
+                  maxLength={PASSWORD_MAX_LENGTH}
+                  aria-describedby={mode === "signup" ? "password-strength password-requirements" : undefined}
+                  value={password}
+                  onChange={(event) => setPassword(event.target.value)}
+                  required
+                />
+                <button
+                  className="password-visibility"
+                  type="button"
+                  aria-label={passwordVisible ? "Hide password" : "Show password"}
+                  aria-pressed={passwordVisible}
+                  title={passwordVisible ? "Hide password" : "Show password"}
+                  onClick={() => setPasswordVisible((visible) => !visible)}
+                >
+                  {passwordVisible ? <EyeOff size={18} aria-hidden="true" /> : <Eye size={18} aria-hidden="true" />}
+                </button>
+              </span>
             </label>
+            {mode === "signup" ? (
+              <div className="password-checker" aria-live="polite">
+                <div className="password-strength-heading" id="password-strength">
+                  <span>Password strength</span>
+                  <strong className={`strength-${passwordAssessment.strength}`}>
+                    {password ? passwordAssessment.label : "Not entered"}
+                  </strong>
+                </div>
+                <meter
+                  className={`password-meter strength-${passwordAssessment.strength}`}
+                  min="0"
+                  max="5"
+                  value={password ? passwordAssessment.score : 0}
+                  aria-label={`Password strength: ${password ? passwordAssessment.label : "not entered"}`}
+                />
+                <p>{password ? passwordAssessment.suggestion : `Use at least ${PASSWORD_MIN_LENGTH} characters.`}</p>
+                <ul id="password-requirements" aria-label="Password recommendations">
+                  <li className={passwordAssessment.checks.minimumLength ? "met" : ""}>At least 8 characters</li>
+                  <li className={passwordAssessment.checks.recommendedLength ? "met" : ""}>12+ recommended</li>
+                  <li className={passwordAssessment.checks.mixedCase ? "met" : ""}>Upper and lowercase</li>
+                  <li className={passwordAssessment.checks.number ? "met" : ""}>A number</li>
+                  <li className={passwordAssessment.checks.symbol ? "met" : ""}>A symbol</li>
+                </ul>
+              </div>
+            ) : null}
             {error ? <p className="form-error" role="alert">{error}</p> : null}
-            <button className="button primary full" disabled={submitting} type="submit">
+            <button
+              className="button primary full"
+              disabled={submitting || (mode === "signup" && password.length > 0 && !passwordAssessment.meetsMinimum)}
+              type="submit"
+            >
               {submitting ? "Please wait…" : mode === "login" ? "Log in" : "Create account"}
             </button>
           </form>

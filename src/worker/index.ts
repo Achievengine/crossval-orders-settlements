@@ -3,6 +3,7 @@ import { deleteCookie, getCookie, setCookie } from "hono/cookie";
 import { z } from "zod";
 
 import { ORDER_STATUSES, calculateOrderTotal, deriveOrderStatus } from "../shared/domain";
+import { PASSWORD_MAX_LENGTH, PASSWORD_MIN_LENGTH } from "../shared/password";
 
 type Bindings = Env;
 type Variables = { userId: string; requestId: string; requestStartedAt: number };
@@ -60,7 +61,7 @@ const WRITE_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 
 const credentialsSchema = z.object({
   email: z.email().max(254).transform((email) => email.trim().toLowerCase()),
-  password: z.string().min(8).max(128),
+  password: z.string().min(PASSWORD_MIN_LENGTH).max(PASSWORD_MAX_LENGTH),
 });
 
 const lineItemSchema = z.object({

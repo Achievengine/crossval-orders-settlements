@@ -147,6 +147,7 @@ The assignment rejects overpayment as a hard invariant. A production accounting 
 
 ## Tenant isolation and security
 
+- Registration includes a live strength meter backed by the same shared 8–128 character policy used by the API; length and character-mix recommendations are announced accessibly.
 - Random session cookies are `HttpOnly`, `Secure`, and `SameSite=Strict`; only token hashes reach D1.
 - Every resource, audit, export, and demo query uses authenticated ownership.
 - Cross-user IDs return `404` to avoid existence disclosure.
