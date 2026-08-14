@@ -1,10 +1,12 @@
-import { FormEvent, useEffect, useState } from "react";
+import { FormEvent, useEffect, useRef, useState } from "react";
 import {
   ArrowLeft,
   Check,
   ChevronRight,
   CircleDollarSign,
+  Download,
   LogOut,
+  PlayCircle,
   Plus,
   ReceiptText,
   Trash2,
@@ -33,6 +35,14 @@ const STATUS_LABELS: Record<OrderStatus, string> = {
   overdue: "Overdue",
 };
 
+const AUDIT_LABELS: Record<string, string> = {
+  "order.created": "Order created",
+  "order.updated": "Order updated",
+  "payment.recorded": "Payment recorded",
+  "order.locked": "Order locked after first payment",
+  "order.paid": "Order paid in full",
+};
+
 const currencyFormatter = new Intl.NumberFormat("en-US", {
   style: "currency",
   currency: "USD",
@@ -46,6 +56,14 @@ function formatDate(date: string): string {
   return new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", year: "numeric" }).format(
     new Date(`${date}T00:00:00`),
   );
+}
+
+function overdueLabel(dueDate: string): string | null {
+  const today = new Date();
+  const due = new Date(`${dueDate}T00:00:00Z`);
+  const todayUtc = Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate());
+  const days = Math.floor((todayUtc - due.getTime()) / 86_400_000);
+  return days > 0 ? `Overdue by ${days} day${days === 1 ? "" : "s"}` : null;
 }
 
 function errorMessage(error: unknown): string {
@@ -163,6 +181,8 @@ function DashboardPage() {
   const [status, setStatus] = useState<OrderStatus | "all">("all");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [creatingDemo, setCreatingDemo] = useState(false);
+  const navigate = useNavigate();
 
   useEffect(() => {
     const controller = new AbortController();
@@ -183,6 +203,20 @@ function DashboardPage() {
   }, [status]);
 
   const outstandingCents = orders.reduce((total, order) => total + order.amountDueCents, 0);
+  const collectedCents = orders.reduce((total, order) => total + order.amountPaidCents, 0);
+  const overdueCount = orders.filter((order) => order.status === "overdue").length;
+
+  async function createDemoScenario() {
+    setCreatingDemo(true);
+    setError("");
+    try {
+      const result = await apiRequest<{ order: { id: string } }>("/api/demo", { method: "POST" });
+      navigate(`/orders/${result.order.id}`);
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+      setCreatingDemo(false);
+    }
+  }
 
   return (
     <main id="main-content" className="page-container">
@@ -192,12 +226,20 @@ function DashboardPage() {
           <h1>Orders and settlements</h1>
           <p>Monitor receivables and record customer payments.</p>
         </div>
-        <Link className="button primary" to="/orders/new"><Plus size={18} /> New order</Link>
+        <div className="header-actions">
+          <a className="button secondary" href="/api/orders.csv"><Download size={17} /> Export CSV</a>
+          <button className="button secondary" type="button" disabled={creatingDemo} onClick={() => void createDemoScenario()}>
+            <PlayCircle size={17} /> {creatingDemo ? "Creating…" : "Load demo"}
+          </button>
+          <Link className="button primary" to="/orders/new"><Plus size={18} /> New order</Link>
+        </div>
       </div>
 
       <div className="summary-strip" aria-label="Order summary">
         <div><span>Visible orders</span><strong>{orders.length}</strong></div>
         <div><span>Outstanding</span><strong>{formatMoney(outstandingCents)}</strong></div>
+        <div><span>Collected</span><strong>{formatMoney(collectedCents)}</strong></div>
+        <div><span>Overdue</span><strong>{overdueCount}</strong></div>
       </div>
 
       <section className="orders-section" aria-labelledby="orders-heading">
@@ -209,6 +251,7 @@ function DashboardPage() {
               <option value="all">All statuses</option>
               {ORDER_STATUSES.map((value) => <option key={value} value={value}>{STATUS_LABELS[value]}</option>)}
             </select>
+            {status !== "all" ? <button className="filter-reset" type="button" onClick={() => setStatus("all")}>Reset</button> : null}
           </label>
         </div>
 
@@ -231,7 +274,7 @@ function DashboardPage() {
               <tbody>
                 {orders.map((order) => (
                   <tr key={order.id}>
-                    <td data-label="Customer"><Link className="customer-link" to={`/orders/${order.id}`}>{order.customer}</Link></td>
+                    <td data-label="Customer"><Link className="customer-link" to={`/orders/${order.id}`}><span>{order.customer}</span><small>{order.orderNumber}</small></Link></td>
                     <td data-label="Status"><StatusBadge status={order.status} /></td>
                     <td data-label="Order total" className="money">{formatMoney(order.totalCents)}</td>
                     <td data-label="Amount paid" className="money">{formatMoney(order.amountPaidCents)}</td>
@@ -339,6 +382,8 @@ function OrderDetailPage() {
   const [paymentError, setPaymentError] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
+  const [paymentSuccess, setPaymentSuccess] = useState("");
+  const idempotencyAttempt = useRef<{ fingerprint: string; key: string } | null>(null);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -355,18 +400,31 @@ function OrderDetailPage() {
   async function handlePayment(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setPaymentError("");
+    setPaymentSuccess("");
     setSubmitting(true);
+    const paymentPayload = {
+      amountCents: Math.round(Number.parseFloat(paymentAmount) * 100),
+      paymentDate,
+      note: note || undefined,
+    };
+    const fingerprint = JSON.stringify(paymentPayload);
+    if (idempotencyAttempt.current?.fingerprint !== fingerprint) {
+      idempotencyAttempt.current = { fingerprint, key: crypto.randomUUID() };
+    }
     try {
       await apiRequest(`/api/orders/${orderId}/payments`, {
         method: "POST",
-        body: JSON.stringify({ amountCents: Math.round(Number.parseFloat(paymentAmount) * 100), paymentDate, note: note || undefined }),
+        headers: { "Idempotency-Key": idempotencyAttempt.current.key },
+        body: JSON.stringify(paymentPayload),
       });
+      idempotencyAttempt.current = null;
+      setPaymentSuccess("Payment recorded successfully.");
       setPaymentAmount("");
       setNote("");
       setRefreshKey((current) => current + 1);
     } catch (requestError) {
       if (requestError instanceof ApiError && requestError.code === "OVERPAYMENT") {
-        const maximum = Number(requestError.details?.maximumAmountCents ?? 0);
+        const maximum = requestError.maxAllowedCents ?? 0;
         setPaymentError(`That payment is too large. Enter ${formatMoney(maximum)} or less.`);
       } else {
         setPaymentError(errorMessage(requestError));
@@ -383,7 +441,7 @@ function OrderDetailPage() {
     <main id="main-content" className="page-container">
       <Link className="back-link" to="/"><ArrowLeft size={17} /> Back to orders</Link>
       <div className="detail-header">
-        <div><div className="detail-title-row"><h1>{order.customer}</h1><StatusBadge status={order.status} /></div><p>Due {formatDate(order.dueDate)} · Created {formatDate(order.createdAt.slice(0, 10))}</p></div>
+        <div><p className="order-reference">{order.orderNumber}</p><div className="detail-title-row"><h1>{order.customer}</h1><StatusBadge status={order.status} /></div><p>Due {formatDate(order.dueDate)} · Created {formatDate(order.createdAt.slice(0, 10))}{order.status === "overdue" ? ` · ${overdueLabel(order.dueDate)}` : ""}</p></div>
         {!order.isEditable ? <span className="locked-note">Read-only after first payment</span> : null}
       </div>
       <div className="amount-band" aria-label="Order amounts">
@@ -395,16 +453,32 @@ function OrderDetailPage() {
       <div className="detail-layout">
         <div className="detail-main">
           <section className="detail-section" aria-labelledby="items-heading"><h2 id="items-heading">Line items</h2><div className="table-scroll"><table className="compact-table"><thead><tr><th>Description</th><th>Quantity</th><th>Unit price</th><th>Amount</th></tr></thead><tbody>{order.items.map((item) => <tr key={item.id}><td data-label="Description">{item.description}</td><td data-label="Quantity">{item.quantity}</td><td data-label="Unit price" className="money">{formatMoney(item.unitPriceCents)}</td><td data-label="Amount" className="money strong">{formatMoney(item.lineTotalCents)}</td></tr>)}</tbody></table></div></section>
-          <section className="detail-section" aria-labelledby="history-heading"><h2 id="history-heading">Payment history</h2>{order.payments.length === 0 ? <p className="muted-copy">No payments recorded.</p> : <div className="payment-list">{order.payments.map((payment) => <div className="payment-row" key={payment.id}><span className="payment-icon"><Check size={16} /></span><div><strong>{formatMoney(payment.amountCents)}</strong><span>{formatDate(payment.paymentDate)}{payment.note ? ` · ${payment.note}` : ""}</span></div></div>)}</div>}</section>
+          <section className="detail-section" aria-labelledby="history-heading"><h2 id="history-heading">Payment history</h2>{order.payments.length === 0 ? <p className="muted-copy">No payments recorded.</p> : <div className="payment-list">{order.payments.map((payment) => <div className="payment-row" key={payment.id}><span className="payment-icon"><Check size={16} /></span><div><strong>{formatMoney(payment.amountCents)} <small>{payment.reference}</small></strong><span>Paid {formatDate(payment.paymentDate)} · Recorded {new Date(`${payment.createdAt.replace(" ", "T")}Z`).toLocaleString()}{payment.note ? ` · ${payment.note}` : ""}</span></div></div>)}</div>}</section>
+          <section className="detail-section" aria-labelledby="audit-heading">
+            <h2 id="audit-heading">Audit timeline</h2>
+            <div className="payment-list">
+              {order.auditEvents.map((event) => (
+                <div className="payment-row" key={event.id}>
+                  <span className="payment-icon"><ReceiptText size={16} /></span>
+                  <div>
+                    <strong>{AUDIT_LABELS[event.eventType] ?? event.eventType}</strong>
+                    <span>{new Date(`${event.createdAt.replace(" ", "T")}Z`).toLocaleString()}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </section>
         </div>
         <aside className="payment-panel" aria-labelledby="record-payment-heading">
           <h2 id="record-payment-heading">Record payment</h2>
           {order.amountDueCents === 0 ? <div className="paid-message"><Check size={20} /><div><strong>Order settled</strong><span>No balance remains.</span></div></div> : (
             <form className="form-stack" onSubmit={handlePayment}>
               <label>Amount (USD)<input name="payment-amount" type="number" min="0.01" max={(order.amountDueCents / 100).toFixed(2)} step="0.01" inputMode="decimal" value={paymentAmount} onChange={(event) => setPaymentAmount(event.target.value)} required /><small>Maximum {formatMoney(order.amountDueCents)}</small></label>
+              <button className="button secondary full" type="button" onClick={() => setPaymentAmount((order.amountDueCents / 100).toFixed(2))}>Pay remaining balance</button>
               <label>Payment date<input name="payment-date" type="date" value={paymentDate} onChange={(event) => setPaymentDate(event.target.value)} required /></label>
               <label>Note <span className="optional">Optional</span><textarea name="payment-note" rows={3} maxLength={500} value={note} onChange={(event) => setNote(event.target.value)} /></label>
               {paymentError ? <p className="form-error" role="alert">{paymentError}</p> : null}
+              {paymentSuccess ? <p className="form-success" role="status">{paymentSuccess}</p> : null}
               <button className="button primary full" type="submit" disabled={submitting}>{submitting ? "Recording…" : "Record payment"}</button>
             </form>
           )}

@@ -1,11 +1,12 @@
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import { deleteCookie, getCookie, setCookie } from "hono/cookie";
 import { z } from "zod";
 
 import { ORDER_STATUSES, calculateOrderTotal, deriveOrderStatus } from "../shared/domain";
 
 type Bindings = Env;
-type Variables = { userId: string };
+type Variables = { userId: string; requestId: string; requestStartedAt: number };
+type AppContext = Context<{ Bindings: Bindings; Variables: Variables }>;
 
 type OrderRow = {
   id: string;
@@ -34,10 +35,28 @@ type PaymentRow = {
   created_at: string;
 };
 
+type IdempotencyRow = {
+  payload_hash: string;
+  response_json: string;
+};
+
+type AuditEventRow = {
+  id: string;
+  event_type: string;
+  actor_user_id: string;
+  request_id: string;
+  metadata_json: string;
+  created_at: string;
+};
+
 const SESSION_COOKIE = "crossval_session";
 const SESSION_DURATION_SECONDS = 60 * 60 * 24 * 7;
 const PBKDF2_ITERATIONS = 100_000;
 const ISO_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+const IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9._:-]{8,200}$/;
+const PAYMENT_OPERATION = "payment.create";
+const MAX_REQUEST_BODY_BYTES = 32 * 1024;
+const WRITE_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 
 const credentialsSchema = z.object({
   email: z.email().max(254).transform((email) => email.trim().toLowerCase()),
@@ -88,6 +107,18 @@ async function sha256(value: string): Promise<string> {
   return encodeBase64(new Uint8Array(digest));
 }
 
+function paymentPayloadHashInput(
+  orderId: string,
+  payment: z.infer<typeof paymentSchema>,
+): string {
+  return JSON.stringify({
+    orderId,
+    amountCents: payment.amountCents,
+    paymentDate: payment.paymentDate,
+    note: payment.note ?? null,
+  });
+}
+
 async function hashPassword(password: string, salt: Uint8Array<ArrayBuffer>): Promise<string> {
   const key = await crypto.subtle.importKey(
     "raw",
@@ -112,27 +143,93 @@ function secureRandomToken(): string {
 }
 
 function apiError(
-  context: Parameters<typeof app.notFound>[0] extends never ? never : Parameters<Parameters<typeof app.notFound>[0]>[0],
-  status: 400 | 401 | 403 | 404 | 409 | 422,
+  context: AppContext,
+  status: 400 | 401 | 403 | 404 | 409 | 413 | 415 | 422 | 429 | 500,
   code: string,
   message: string,
-  details?: unknown,
+  options: {
+    field?: string;
+    maxAllowedCents?: number;
+    retryable?: boolean;
+    details?: unknown;
+    retryAfterSeconds?: number;
+  } = {},
 ) {
-  return context.json({ error: { code, message, ...(details === undefined ? {} : { details }) } }, status);
+  if (options.retryAfterSeconds !== undefined) {
+    context.header("Retry-After", String(options.retryAfterSeconds));
+  }
+  return context.json({
+    error: {
+      code,
+      message,
+      ...(options.field === undefined ? {} : { field: options.field }),
+      ...(options.maxAllowedCents === undefined
+        ? {}
+        : { max_allowed_cents: options.maxAllowedCents }),
+      request_id: context.get("requestId"),
+      retryable: options.retryable ?? false,
+      ...(options.details === undefined ? {} : { details: options.details }),
+    },
+  }, status);
 }
 
-async function parseBody(context: { req: { json: () => Promise<unknown> } }): Promise<unknown> {
-  try {
-    return await context.req.json();
-  } catch {
-    return undefined;
+async function parseBody(context: AppContext): Promise<unknown> {
+  const body = await context.req.raw.arrayBuffer();
+  if (body.byteLength > MAX_REQUEST_BODY_BYTES) {
+    throw new ApiFailure(413, "REQUEST_TOO_LARGE", "Request body exceeds the 32 KiB limit.");
   }
+  try {
+    return JSON.parse(new TextDecoder().decode(body)) as unknown;
+  } catch {
+    throw new ApiFailure(400, "INVALID_JSON", "Request body must contain valid JSON.");
+  }
+}
+
+class ApiFailure extends Error {
+  constructor(
+    readonly status: 400 | 401 | 403 | 404 | 409 | 413 | 415 | 422 | 429,
+    readonly code: string,
+    message: string,
+    readonly options: Parameters<typeof apiError>[4] = {},
+  ) {
+    super(message);
+  }
+}
+
+async function consumeRateLimit(
+  context: AppContext,
+  action: string,
+  scope: string,
+  limit: number,
+  windowSeconds: number,
+): Promise<Response | null> {
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const windowStartedAt = Math.floor(nowSeconds / windowSeconds) * windowSeconds;
+  const scopeHash = await sha256(scope);
+  const result = await context.env.DB.prepare(
+    `INSERT INTO rate_limits (scope_hash, action, window_started_at, request_count)
+     VALUES (?, ?, ?, 1)
+     ON CONFLICT(scope_hash, action, window_started_at)
+     DO UPDATE SET request_count = request_count + 1
+     RETURNING request_count`,
+  )
+    .bind(scopeHash, action, windowStartedAt)
+    .first<{ request_count: number }>();
+  if ((result?.request_count ?? 1) <= limit) {
+    return null;
+  }
+  const retryAfterSeconds = windowStartedAt + windowSeconds - nowSeconds;
+  return apiError(context, 429, "RATE_LIMITED", "Too many requests. Try again later.", {
+    retryable: true,
+    retryAfterSeconds,
+  });
 }
 
 function formatOrder(row: OrderRow, today = new Date().toISOString().slice(0, 10)) {
   const amountDueCents = Math.max(row.total_cents - row.amount_paid_cents, 0);
   return {
     id: row.id,
+    orderNumber: `ORD-${row.id.replaceAll("-", "").slice(0, 8).toUpperCase()}`,
     customer: row.customer,
     dueDate: row.due_date,
     totalCents: row.total_cents,
@@ -158,11 +255,53 @@ function formatItem(row: ItemRow) {
 function formatPayment(row: PaymentRow) {
   return {
     id: row.id,
+    reference: `PAY-${row.id.replaceAll("-", "").slice(0, 8).toUpperCase()}`,
     amountCents: row.amount_cents,
     paymentDate: row.payment_date,
     note: row.note,
     createdAt: row.created_at,
   };
+}
+
+function escapeCsvValue(value: string | number): string {
+  let text = String(value);
+  if (/^[=+\-@]/.test(text)) {
+    text = `'${text}`;
+  }
+  return `"${text.replaceAll('"', '""')}"`;
+}
+
+function formatAuditEvent(row: AuditEventRow) {
+  return {
+    id: row.id,
+    eventType: row.event_type,
+    actorUserId: row.actor_user_id,
+    requestId: row.request_id,
+    metadata: JSON.parse(row.metadata_json) as Record<string, unknown>,
+    createdAt: row.created_at,
+  };
+}
+
+function auditStatement(
+  context: { env: Bindings; get: (key: "userId" | "requestId") => string },
+  orderId: string,
+  eventType: string,
+  metadata: Record<string, unknown>,
+) {
+  const userId = context.get("userId");
+  return context.env.DB.prepare(
+    `INSERT INTO audit_events
+      (id, user_id, order_id, event_type, actor_user_id, request_id, metadata_json)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).bind(
+    crypto.randomUUID(),
+    userId,
+    orderId,
+    eventType,
+    userId,
+    context.get("requestId"),
+    JSON.stringify(metadata),
+  );
 }
 
 async function createSessionData(): Promise<{ token: string; tokenHash: string; expiresAt: string }> {
@@ -192,20 +331,82 @@ function setSessionCookie(context: Parameters<typeof setCookie>[0], token: strin
   });
 }
 
+app.use("*", async (context, next) => {
+  const requestId = `req_${crypto.randomUUID().replaceAll("-", "")}`;
+  context.set("requestId", requestId);
+  context.set("requestStartedAt", Date.now());
+  await next();
+  const headers = new Headers(context.res.headers);
+  headers.set("X-Request-Id", requestId);
+  headers.set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'");
+  headers.set("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+  headers.set("X-Content-Type-Options", "nosniff");
+  headers.set("X-Frame-Options", "DENY");
+  headers.set("Referrer-Policy", "no-referrer");
+  headers.set("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+  context.res = new Response(context.res.body, {
+    status: context.res.status,
+    statusText: context.res.statusText,
+    headers,
+  });
+  console.log(JSON.stringify({
+    event: "request_completed",
+    requestId,
+    method: context.req.method,
+    route: context.req.path,
+    status: context.res.status,
+    durationMs: Date.now() - context.get("requestStartedAt"),
+    userId: context.get("userId") || undefined,
+  }));
+});
+
 app.use("/api/*", async (context, next) => {
   context.header("Cache-Control", "no-store");
+  if (WRITE_METHODS.has(context.req.method)) {
+    const contentType = context.req.header("Content-Type")?.split(";", 1)[0].trim();
+    const contentLength = Number(context.req.header("Content-Length") ?? 0);
+    const hasBody = contentLength > 0 || context.req.header("Transfer-Encoding") !== undefined;
+    if ((hasBody || contentType !== undefined) && contentType !== "application/json") {
+      return apiError(context, 415, "UNSUPPORTED_MEDIA_TYPE", "Use Content-Type: application/json.");
+    }
+    if (contentLength > MAX_REQUEST_BODY_BYTES) {
+      return apiError(context, 413, "REQUEST_TOO_LARGE", "Request body exceeds the 32 KiB limit.");
+    }
+    const origin = context.req.header("Origin");
+    if (origin && origin !== new URL(context.req.url).origin) {
+      return apiError(context, 403, "ORIGIN_NOT_ALLOWED", "Cross-origin writes are not allowed.");
+    }
+    if (context.req.header("Sec-Fetch-Site") === "cross-site") {
+      return apiError(context, 403, "ORIGIN_NOT_ALLOWED", "Cross-origin writes are not allowed.");
+    }
+  }
   await next();
 });
 
 app.get("/api/health", async (context) => {
   const database = await context.env.DB.prepare("SELECT 1 AS healthy").first<{ healthy: number }>();
-  return context.json({ data: { status: database?.healthy === 1 ? "ok" : "degraded" } });
+  return context.json({
+    data: {
+      status: database?.healthy === 1 ? "ok" : "degraded",
+      version: context.env.APP_VERSION,
+    },
+  });
 });
 
 app.post("/api/auth/signup", async (context) => {
+  const rateLimited = await consumeRateLimit(
+    context,
+    "auth.signup",
+    context.req.header("CF-Connecting-IP") ?? "local",
+    10,
+    15 * 60,
+  );
+  if (rateLimited) return rateLimited;
   const parsed = credentialsSchema.safeParse(await parseBody(context));
   if (!parsed.success) {
-    return apiError(context, 422, "VALIDATION_ERROR", "Check the highlighted fields.", parsed.error.flatten());
+    return apiError(context, 422, "VALIDATION_ERROR", "Check the highlighted fields.", {
+      details: parsed.error.flatten(),
+    });
   }
 
   const userId = crypto.randomUUID();
@@ -234,9 +435,19 @@ app.post("/api/auth/signup", async (context) => {
 });
 
 app.post("/api/auth/login", async (context) => {
+  const rateLimited = await consumeRateLimit(
+    context,
+    "auth.login",
+    context.req.header("CF-Connecting-IP") ?? "local",
+    10,
+    15 * 60,
+  );
+  if (rateLimited) return rateLimited;
   const parsed = credentialsSchema.safeParse(await parseBody(context));
   if (!parsed.success) {
-    return apiError(context, 422, "VALIDATION_ERROR", "Enter a valid email and password.", parsed.error.flatten());
+    return apiError(context, 422, "VALIDATION_ERROR", "Enter a valid email and password.", {
+      details: parsed.error.flatten(),
+    });
   }
 
   const user = await context.env.DB.prepare(
@@ -315,7 +526,7 @@ app.get("/api/orders", async (context) => {
       COALESCE(SUM(p.amount_cents), 0) AS amount_paid_cents
      FROM orders o
      LEFT JOIN payments p ON p.order_id = o.id
-     WHERE o.user_id = ?
+    WHERE o.user_id = ? AND o.deleted_at IS NULL
      GROUP BY o.id
      ORDER BY o.created_at DESC`,
   )
@@ -325,10 +536,93 @@ app.get("/api/orders", async (context) => {
   return context.json({ data: { orders: requestedStatus ? orders.filter((order) => order.status === requestedStatus) : orders } });
 });
 
+app.get("/api/orders.csv", async (context) => {
+  const rows = await context.env.DB.prepare(
+    `SELECT o.id, o.customer, o.due_date, o.total_cents, o.created_at, o.updated_at,
+      COALESCE(SUM(p.amount_cents), 0) AS amount_paid_cents
+     FROM orders o
+     LEFT JOIN payments p ON p.order_id = o.id
+    WHERE o.user_id = ? AND o.deleted_at IS NULL
+     GROUP BY o.id
+     ORDER BY o.created_at DESC`,
+  )
+    .bind(context.get("userId"))
+    .all<OrderRow>();
+  const header = ["order_number", "customer", "status", "total_cents", "paid_cents", "due_cents", "due_date"];
+  const lines = rows.results.map((row) => {
+    const order = formatOrder(row);
+    return [
+      order.orderNumber,
+      order.customer,
+      order.status,
+      order.totalCents,
+      order.amountPaidCents,
+      order.amountDueCents,
+      order.dueDate,
+    ].map(escapeCsvValue).join(",");
+  });
+  context.header("Content-Type", "text/csv; charset=utf-8");
+  context.header("Content-Disposition", `attachment; filename="orders-${new Date().toISOString().slice(0, 10)}.csv"`);
+  return context.body([header.map(escapeCsvValue).join(","), ...lines].join("\n"));
+});
+
+app.post("/api/demo", async (context) => {
+  const userId = context.get("userId");
+  const orderId = crypto.randomUUID();
+  const paymentId = crypto.randomUUID();
+  const idempotencyKey = `demo-${crypto.randomUUID()}`;
+  const keyHash = await sha256(idempotencyKey);
+  const paymentData = {
+    amountCents: 40_000,
+    paymentDate: new Date().toISOString().slice(0, 10),
+    note: "Demo first installment",
+  };
+  const payloadHash = await sha256(paymentPayloadHashInput(orderId, paymentData));
+  const responseBody = { data: { payment: { id: paymentId, amountCents: 40_000 } } };
+  const suffix = orderId.replaceAll("-", "").slice(0, 4).toUpperCase();
+  const dueDate = new Date(Date.now() + 7 * 86_400_000).toISOString().slice(0, 10);
+
+  await context.env.DB.batch([
+    context.env.DB.prepare(
+      "INSERT INTO orders (id, user_id, customer, due_date, total_cents) VALUES (?, ?, ?, ?, ?)",
+    ).bind(orderId, userId, `Demo Company ${suffix}`, dueDate, 100_000),
+    context.env.DB.prepare(
+      `INSERT INTO order_items
+        (id, order_id, description, quantity, unit_price_cents, line_total_cents, position)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).bind(crypto.randomUUID(), orderId, "Implementation services", 2, 50_000, 100_000, 0),
+    context.env.DB.prepare(
+      "INSERT INTO payments (id, order_id, amount_cents, payment_date, note) VALUES (?, ?, ?, ?, ?)",
+    ).bind(paymentId, orderId, 40_000, paymentData.paymentDate, paymentData.note),
+    context.env.DB.prepare(
+      `INSERT INTO idempotency_records
+        (user_id, operation, key_hash, payload_hash, payment_id, response_json)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).bind(userId, PAYMENT_OPERATION, keyHash, payloadHash, paymentId, JSON.stringify(responseBody)),
+    auditStatement(context, orderId, "order.created", {
+      customer: `Demo Company ${suffix}`,
+      totalCents: 100_000,
+      dueDate,
+      lineItemCount: 1,
+      demo: true,
+    }),
+    auditStatement(context, orderId, "payment.recorded", {
+      paymentId,
+      amountCents: 40_000,
+      paymentDate: paymentData.paymentDate,
+    }),
+    auditStatement(context, orderId, "order.locked", { paymentId }),
+  ]);
+
+  return context.json({ data: { order: { id: orderId, orderNumber: `ORD-${orderId.replaceAll("-", "").slice(0, 8).toUpperCase()}` } } }, 201);
+});
+
 app.post("/api/orders", async (context) => {
   const parsed = orderSchema.safeParse(await parseBody(context));
   if (!parsed.success) {
-    return apiError(context, 422, "VALIDATION_ERROR", "Check the order fields.", parsed.error.flatten());
+    return apiError(context, 422, "VALIDATION_ERROR", "Check the order fields.", {
+      details: parsed.error.flatten(),
+    });
   }
 
   const totalCents = calculateOrderTotal(parsed.data.items);
@@ -356,6 +650,12 @@ app.post("/api/orders", async (context) => {
         position,
       ),
     ),
+    auditStatement(context, orderId, "order.created", {
+      customer: parsed.data.customer,
+      totalCents,
+      dueDate: parsed.data.dueDate,
+      lineItemCount: parsed.data.items.length,
+    }),
   ];
   await context.env.DB.batch(statements);
   return context.json({ data: { order: { id: orderId, totalCents } } }, 201);
@@ -367,7 +667,7 @@ app.get("/api/orders/:orderId", async (context) => {
       COALESCE(SUM(p.amount_cents), 0) AS amount_paid_cents
      FROM orders o
      LEFT JOIN payments p ON p.order_id = o.id
-     WHERE o.id = ? AND o.user_id = ?
+    WHERE o.id = ? AND o.user_id = ? AND o.deleted_at IS NULL
      GROUP BY o.id
      LIMIT 1`,
   )
@@ -377,7 +677,7 @@ app.get("/api/orders/:orderId", async (context) => {
     return apiError(context, 404, "ORDER_NOT_FOUND", "Order not found.");
   }
 
-  const [items, payments] = await Promise.all([
+  const [items, payments, auditEvents] = await Promise.all([
     context.env.DB.prepare(
       `SELECT id, description, quantity, unit_price_cents, line_total_cents, position
        FROM order_items WHERE order_id = ? ORDER BY position`,
@@ -390,6 +690,13 @@ app.get("/api/orders/:orderId", async (context) => {
     )
       .bind(order.id)
       .all<PaymentRow>(),
+    context.env.DB.prepare(
+      `SELECT id, event_type, actor_user_id, request_id, metadata_json, created_at
+       FROM audit_events WHERE user_id = ? AND order_id = ?
+       ORDER BY created_at ASC, rowid ASC`,
+    )
+      .bind(context.get("userId"), order.id)
+      .all<AuditEventRow>(),
   ]);
   return context.json({
     data: {
@@ -397,6 +704,7 @@ app.get("/api/orders/:orderId", async (context) => {
         ...formatOrder(order),
         items: items.results.map(formatItem),
         payments: payments.results.map(formatPayment),
+        auditEvents: auditEvents.results.map(formatAuditEvent),
         isEditable: payments.results.length === 0,
       },
     },
@@ -406,12 +714,14 @@ app.get("/api/orders/:orderId", async (context) => {
 app.put("/api/orders/:orderId", async (context) => {
   const parsed = orderSchema.safeParse(await parseBody(context));
   if (!parsed.success) {
-    return apiError(context, 422, "VALIDATION_ERROR", "Check the order fields.", parsed.error.flatten());
+    return apiError(context, 422, "VALIDATION_ERROR", "Check the order fields.", {
+      details: parsed.error.flatten(),
+    });
   }
 
   const existing = await context.env.DB.prepare(
     `SELECT o.id, EXISTS(SELECT 1 FROM payments p WHERE p.order_id = o.id) AS has_payments
-     FROM orders o WHERE o.id = ? AND o.user_id = ? LIMIT 1`,
+    FROM orders o WHERE o.id = ? AND o.user_id = ? AND o.deleted_at IS NULL LIMIT 1`,
   )
     .bind(context.req.param("orderId"), context.get("userId"))
     .first<{ id: string; has_payments: number }>();
@@ -426,7 +736,7 @@ app.put("/api/orders/:orderId", async (context) => {
   const statements = [
     context.env.DB.prepare(
       `UPDATE orders SET customer = ?, due_date = ?, total_cents = ?, updated_at = datetime('now')
-       WHERE id = ? AND user_id = ?`,
+      WHERE id = ? AND user_id = ? AND deleted_at IS NULL`,
     ).bind(parsed.data.customer, parsed.data.dueDate, totalCents, existing.id, context.get("userId")),
     context.env.DB.prepare("DELETE FROM order_items WHERE order_id = ?").bind(existing.id),
     ...parsed.data.items.map((item, position) =>
@@ -439,6 +749,12 @@ app.put("/api/orders/:orderId", async (context) => {
         item.quantity * item.unitPriceCents, position,
       ),
     ),
+    auditStatement(context, existing.id, "order.updated", {
+      customer: parsed.data.customer,
+      totalCents,
+      dueDate: parsed.data.dueDate,
+      lineItemCount: parsed.data.items.length,
+    }),
   ];
 
   try {
@@ -453,37 +769,87 @@ app.put("/api/orders/:orderId", async (context) => {
 });
 
 app.delete("/api/orders/:orderId", async (context) => {
-  try {
-    const result = await context.env.DB.prepare("DELETE FROM orders WHERE id = ? AND user_id = ?")
-      .bind(context.req.param("orderId"), context.get("userId"))
-      .run();
-    if (!result.meta.changes) {
-      return apiError(context, 404, "ORDER_NOT_FOUND", "Order not found.");
-    }
-  } catch (error) {
-    if (error instanceof Error && error.message.includes("ORDER_LOCKED_AFTER_PAYMENT")) {
-      return apiError(context, 409, "ORDER_LOCKED", "Orders cannot be deleted after the first payment.");
-    }
-    throw error;
+  const existing = await context.env.DB.prepare(
+    `SELECT o.id, EXISTS(SELECT 1 FROM payments p WHERE p.order_id = o.id) AS has_payments
+     FROM orders o
+     WHERE o.id = ? AND o.user_id = ? AND o.deleted_at IS NULL LIMIT 1`,
+  )
+    .bind(context.req.param("orderId"), context.get("userId"))
+    .first<{ id: string; has_payments: number }>();
+  if (!existing) {
+    return apiError(context, 404, "ORDER_NOT_FOUND", "Order not found.");
   }
+  if (existing.has_payments) {
+    return apiError(context, 409, "ORDER_LOCKED", "Orders cannot be deleted after the first payment.");
+  }
+  await context.env.DB.prepare(
+    "UPDATE orders SET deleted_at = datetime('now'), updated_at = datetime('now') WHERE id = ? AND user_id = ?",
+  )
+    .bind(existing.id, context.get("userId"))
+    .run();
   return context.body(null, 204);
 });
 
 app.post("/api/orders/:orderId/payments", async (context) => {
+  const rateLimited = await consumeRateLimit(
+    context,
+    "payment.create",
+    context.get("userId"),
+    30,
+    60,
+  );
+  if (rateLimited) return rateLimited;
+  const idempotencyKey = context.req.header("Idempotency-Key");
+  if (!idempotencyKey || !IDEMPOTENCY_KEY_PATTERN.test(idempotencyKey)) {
+    return apiError(
+      context,
+      400,
+      "INVALID_IDEMPOTENCY_KEY",
+      "Provide an Idempotency-Key header containing 8 to 200 letters, numbers, dots, colons, underscores, or hyphens.",
+    );
+  }
+
   const parsed = paymentSchema.safeParse(await parseBody(context));
   if (!parsed.success) {
-    return apiError(context, 422, "VALIDATION_ERROR", "Check the payment fields.", parsed.error.flatten());
+    return apiError(context, 422, "VALIDATION_ERROR", "Check the payment fields.", {
+      details: parsed.error.flatten(),
+    });
+  }
+
+  const userId = context.get("userId");
+  const orderId = context.req.param("orderId");
+  const keyHash = await sha256(idempotencyKey);
+  const payloadHash = await sha256(paymentPayloadHashInput(orderId, parsed.data));
+  const existingIdempotency = await context.env.DB.prepare(
+    `SELECT payload_hash, response_json FROM idempotency_records
+     WHERE user_id = ? AND operation = ? AND key_hash = ? LIMIT 1`,
+  )
+    .bind(userId, PAYMENT_OPERATION, keyHash)
+    .first<IdempotencyRow>();
+  if (existingIdempotency) {
+    if (existingIdempotency.payload_hash !== payloadHash) {
+      return apiError(
+        context,
+        409,
+        "IDEMPOTENCY_KEY_REUSED",
+        "This Idempotency-Key was already used with different payment details. Use a new key.",
+      );
+    }
+    context.header("Idempotency-Replayed", "true");
+    return context.json(JSON.parse(existingIdempotency.response_json) as { data: unknown }, 201);
   }
 
   const balance = await context.env.DB.prepare(
-    `SELECT o.total_cents - COALESCE(SUM(p.amount_cents), 0) AS amount_due_cents
+    `SELECT o.total_cents,
+      COALESCE(SUM(p.amount_cents), 0) AS amount_paid_cents,
+      o.total_cents - COALESCE(SUM(p.amount_cents), 0) AS amount_due_cents
      FROM orders o
      LEFT JOIN payments p ON p.order_id = o.id
-     WHERE o.id = ? AND o.user_id = ?
+    WHERE o.id = ? AND o.user_id = ? AND o.deleted_at IS NULL
      GROUP BY o.id LIMIT 1`,
   )
-    .bind(context.req.param("orderId"), context.get("userId"))
-    .first<{ amount_due_cents: number }>();
+    .bind(orderId, userId)
+    .first<{ total_cents: number; amount_paid_cents: number; amount_due_cents: number }>();
   if (!balance) {
     return apiError(context, 404, "ORDER_NOT_FOUND", "Order not found.");
   }
@@ -493,25 +859,42 @@ app.post("/api/orders/:orderId/payments", async (context) => {
       409,
       "OVERPAYMENT",
       `Payment exceeds the remaining balance. The maximum allowed amount is ${balance.amount_due_cents} cents.`,
-      { maximumAmountCents: balance.amount_due_cents },
+      { field: "amount", maxAllowedCents: balance.amount_due_cents },
     );
   }
 
   const paymentId = crypto.randomUUID();
+  const responseBody = { data: { payment: { id: paymentId, amountCents: parsed.data.amountCents } } };
   try {
-    await context.env.DB.prepare(
-      "INSERT INTO payments (id, order_id, amount_cents, payment_date, note) VALUES (?, ?, ?, ?, ?)",
-    )
-      .bind(paymentId, context.req.param("orderId"), parsed.data.amountCents, parsed.data.paymentDate, parsed.data.note ?? null)
-      .run();
+    await context.env.DB.batch([
+      context.env.DB.prepare(
+        "INSERT INTO payments (id, order_id, amount_cents, payment_date, note) VALUES (?, ?, ?, ?, ?)",
+      ).bind(paymentId, orderId, parsed.data.amountCents, parsed.data.paymentDate, parsed.data.note ?? null),
+      context.env.DB.prepare(
+        `INSERT INTO idempotency_records
+          (user_id, operation, key_hash, payload_hash, payment_id, response_json)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      ).bind(userId, PAYMENT_OPERATION, keyHash, payloadHash, paymentId, JSON.stringify(responseBody)),
+      auditStatement(context, orderId, "payment.recorded", {
+        paymentId,
+        amountCents: parsed.data.amountCents,
+        paymentDate: parsed.data.paymentDate,
+      }),
+      ...(balance.amount_paid_cents === 0
+        ? [auditStatement(context, orderId, "order.locked", { paymentId })]
+        : []),
+      ...(balance.amount_due_cents === parsed.data.amountCents
+        ? [auditStatement(context, orderId, "order.paid", { paymentId })]
+        : []),
+    ]);
   } catch (error) {
     if (error instanceof Error && error.message.includes("PAYMENT_EXCEEDS_ORDER_BALANCE")) {
       const latest = await context.env.DB.prepare(
         `SELECT o.total_cents - COALESCE(SUM(p.amount_cents), 0) AS amount_due_cents
          FROM orders o LEFT JOIN payments p ON p.order_id = o.id
-         WHERE o.id = ? AND o.user_id = ? GROUP BY o.id`,
+         WHERE o.id = ? AND o.user_id = ? AND o.deleted_at IS NULL GROUP BY o.id`,
       )
-        .bind(context.req.param("orderId"), context.get("userId"))
+        .bind(orderId, userId)
         .first<{ amount_due_cents: number }>();
       const maximumAmountCents = Math.max(latest?.amount_due_cents ?? 0, 0);
       return apiError(
@@ -519,38 +902,54 @@ app.post("/api/orders/:orderId/payments", async (context) => {
         409,
         "OVERPAYMENT",
         `Payment exceeds the remaining balance. The maximum allowed amount is ${maximumAmountCents} cents.`,
-        { maximumAmountCents },
+        { field: "amount", maxAllowedCents: maximumAmountCents },
       );
+    }
+    if (error instanceof Error && error.message.includes("UNIQUE")) {
+      const racedRecord = await context.env.DB.prepare(
+        `SELECT payload_hash, response_json FROM idempotency_records
+         WHERE user_id = ? AND operation = ? AND key_hash = ? LIMIT 1`,
+      )
+        .bind(userId, PAYMENT_OPERATION, keyHash)
+        .first<IdempotencyRow>();
+      if (racedRecord?.payload_hash === payloadHash) {
+        context.header("Idempotency-Replayed", "true");
+        return context.json(JSON.parse(racedRecord.response_json) as { data: unknown }, 201);
+      }
+      if (racedRecord) {
+        return apiError(
+          context,
+          409,
+          "IDEMPOTENCY_KEY_REUSED",
+          "This Idempotency-Key was already used with different payment details. Use a new key.",
+        );
+      }
     }
     throw error;
   }
 
-  return context.json({ data: { payment: { id: paymentId, amountCents: parsed.data.amountCents } } }, 201);
+  return context.json(responseBody, 201);
 });
 
-app.notFound((context) =>
-  context.json(
-    {
-      error: {
-        code: "NOT_FOUND",
-        message: "The requested API endpoint does not exist.",
-      },
-    },
-    404,
-  ),
-);
+app.notFound((context) => {
+  if (context.req.path.startsWith("/api/")) {
+    return apiError(context, 404, "NOT_FOUND", "The requested API endpoint does not exist.");
+  }
+  return context.env.ASSETS.fetch(context.req.raw);
+});
 
 app.onError((error, context) => {
-  console.error(JSON.stringify({ event: "unhandled_error", message: error.message }));
-  return context.json(
-    {
-      error: {
-        code: "INTERNAL_ERROR",
-        message: "An unexpected error occurred. Please try again.",
-      },
-    },
-    500,
-  );
+  if (error instanceof ApiFailure) {
+    return apiError(context, error.status, error.code, error.message, error.options);
+  }
+  console.error(JSON.stringify({
+    event: "unhandled_error",
+    requestId: context.get("requestId"),
+    message: error.message,
+  }));
+  return apiError(context, 500, "INTERNAL_ERROR", "An unexpected error occurred. Please try again.", {
+    retryable: true,
+  });
 });
 
 export default app;

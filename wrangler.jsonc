@@ -4,11 +4,14 @@
   "main": "src/worker/index.ts",
   "compatibility_date": "2026-08-14",
   "compatibility_flags": ["nodejs_compat"],
+  "vars": {
+    "APP_VERSION": "1.1.0"
+  },
   "assets": {
     "binding": "ASSETS",
     "directory": "./dist",
     "not_found_handling": "single-page-application",
-    "run_worker_first": ["/api/*"]
+    "run_worker_first": true
   },
   "d1_databases": [
     {

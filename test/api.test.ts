@@ -3,11 +3,11 @@ import { describe, expect, it } from "vitest";
 
 import app from "../src/worker";
 
-type ApiResponse<T> = { data: T } | { error: { code: string; message: string; details?: unknown } };
+type ApiResponse<T> = { data: T } | { error: { code: string; message: string; details?: unknown; request_id: string; max_allowed_cents?: number } };
 
 async function request<T>(path: string, init?: RequestInit, cookie?: string) {
   const headers = new Headers(init?.headers);
-  if (init?.body) {
+  if (init?.body && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
   }
   if (cookie) {
@@ -21,6 +21,7 @@ async function request<T>(path: string, init?: RequestInit, cookie?: string) {
 async function signup(email: string): Promise<string> {
   const { response } = await request("/api/auth/signup", {
     method: "POST",
+    headers: { "CF-Connecting-IP": email },
     body: JSON.stringify({ email, password: "correct-horse-battery-staple" }),
   });
   expect(response.status).toBe(201);
@@ -50,11 +51,17 @@ async function createOrder(cookie: string, dueDate = "2099-01-01"): Promise<stri
   return body.data.order.id;
 }
 
-async function pay(orderId: string, amountCents: number, cookie: string) {
+async function pay(
+  orderId: string,
+  amountCents: number,
+  cookie: string,
+  idempotencyKey = crypto.randomUUID(),
+) {
   return request<{ payment: { id: string; amountCents: number } }>(
     `/api/orders/${orderId}/payments`,
     {
       method: "POST",
+      headers: { "Idempotency-Key": idempotencyKey },
       body: JSON.stringify({ amountCents, paymentDate: "2026-08-14", note: "Bank transfer" }),
     },
     cookie,
@@ -106,7 +113,7 @@ describe("orders and settlements API", () => {
     expect(overpayment.body).toMatchObject({
       error: {
         code: "OVERPAYMENT",
-        details: { maximumAmountCents: 0 },
+        max_allowed_cents: 0,
       },
     });
     expect(overpayment.body && "error" in overpayment.body ? overpayment.body.error.message : "").toContain(
@@ -156,5 +163,260 @@ describe("orders and settlements API", () => {
       .bind(orderId)
       .first<{ paid: number }>();
     expect(total?.paid).toBe(100_000);
+  });
+
+  it("replays the original payment for the same idempotency key and payload", async () => {
+    // #given
+    const cookie = await signup("idempotent-replay@example.com");
+    const orderId = await createOrder(cookie);
+    const key = "payment-replay-key";
+
+    // #when
+    const first = await pay(orderId, 40_000, cookie, key);
+    const replay = await pay(orderId, 40_000, cookie, key);
+
+    // #then
+    expect(replay.response.status).toBe(201);
+    expect(replay.response.headers.get("Idempotency-Replayed")).toBe("true");
+    expect(replay.body).toEqual(first.body);
+    const count = await env.DB.prepare("SELECT COUNT(*) AS count FROM payments WHERE order_id = ?")
+      .bind(orderId)
+      .first<{ count: number }>();
+    expect(count?.count).toBe(1);
+  });
+
+  it("rejects an idempotency key reused with different payment details", async () => {
+    // #given
+    const cookie = await signup("idempotent-mismatch@example.com");
+    const orderId = await createOrder(cookie);
+    const key = "payment-mismatch-key";
+    await pay(orderId, 40_000, cookie, key);
+
+    // #when
+    const mismatch = await pay(orderId, 60_000, cookie, key);
+
+    // #then
+    expect(mismatch.response.status).toBe(409);
+    expect(mismatch.body).toMatchObject({ error: { code: "IDEMPOTENCY_KEY_REUSED" } });
+  });
+
+  it("creates one payment when identical idempotent requests race", async () => {
+    // #given
+    const cookie = await signup("idempotent-race@example.com");
+    const orderId = await createOrder(cookie);
+    const key = "payment-concurrent-key";
+
+    // #when
+    const results = await Promise.all([
+      pay(orderId, 40_000, cookie, key),
+      pay(orderId, 40_000, cookie, key),
+    ]);
+
+    // #then
+    expect(results.every((result) => result.response.status === 201)).toBe(true);
+    const ids = results.map((result) =>
+      result.body && "data" in result.body ? result.body.data.payment.id : undefined,
+    );
+    expect(new Set(ids).size).toBe(1);
+    const count = await env.DB.prepare("SELECT COUNT(*) AS count FROM payments WHERE order_id = ?")
+      .bind(orderId)
+      .first<{ count: number }>();
+    expect(count?.count).toBe(1);
+  });
+
+  it("scopes idempotency keys to each authenticated user", async () => {
+    // #given
+    const userACookie = await signup("idempotent-user-a@example.com");
+    const userBCookie = await signup("idempotent-user-b@example.com");
+    const userAOrder = await createOrder(userACookie);
+    const userBOrder = await createOrder(userBCookie);
+    const sharedKey = "shared-across-users";
+
+    // #when
+    const userAResult = await pay(userAOrder, 40_000, userACookie, sharedKey);
+    const userBResult = await pay(userBOrder, 40_000, userBCookie, sharedKey);
+
+    // #then
+    expect(userAResult.response.status).toBe(201);
+    expect(userBResult.response.status).toBe(201);
+  });
+
+  it("records an owner-scoped immutable audit timeline", async () => {
+    // #given
+    const cookie = await signup("audit-owner@example.com");
+    const orderId = await createOrder(cookie);
+
+    // #when
+    await pay(orderId, 40_000, cookie, "audit-payment-key");
+    const detail = await request<{
+      order: { auditEvents: Array<{ eventType: string; metadata: Record<string, unknown> }> };
+    }>(`/api/orders/${orderId}`, undefined, cookie);
+
+    // #then
+    expect(detail.body).toMatchObject({
+      data: {
+        order: {
+          auditEvents: [
+            { eventType: "order.created" },
+            { eventType: "payment.recorded", metadata: { amountCents: 40_000 } },
+            { eventType: "order.locked" },
+          ],
+        },
+      },
+    });
+  });
+
+  it("prevents audit event updates and deletes at the database layer", async () => {
+    // #given
+    const cookie = await signup("audit-immutable@example.com");
+    const orderId = await createOrder(cookie);
+    const event = await env.DB.prepare("SELECT id FROM audit_events WHERE order_id = ? LIMIT 1")
+      .bind(orderId)
+      .first<{ id: string }>();
+
+    // #when / #then
+    await expect(env.DB.prepare("UPDATE audit_events SET event_type = 'order.updated' WHERE id = ?")
+      .bind(event?.id)
+      .run()).rejects.toThrow("AUDIT_EVENTS_ARE_IMMUTABLE");
+    await expect(env.DB.prepare("DELETE FROM audit_events WHERE id = ?")
+      .bind(event?.id)
+      .run()).rejects.toThrow("AUDIT_EVENTS_ARE_IMMUTABLE");
+  });
+
+  it("records lock and paid events when the first payment settles the order", async () => {
+    // #given
+    const cookie = await signup("audit-full-first@example.com");
+    const orderId = await createOrder(cookie);
+
+    // #when
+    await pay(orderId, 100_000, cookie, "audit-full-first-key");
+    const events = await env.DB.prepare(
+      "SELECT event_type FROM audit_events WHERE order_id = ? ORDER BY rowid",
+    )
+      .bind(orderId)
+      .all<{ event_type: string }>();
+
+    // #then
+    expect(events.results.map((event) => event.event_type)).toEqual([
+      "order.created",
+      "payment.recorded",
+      "order.locked",
+      "order.paid",
+    ]);
+  });
+
+  it("returns correlated structured errors and rejects unsafe requests", async () => {
+    // #given / #when
+    const unauthenticated = await request("/api/orders");
+    const unsupported = await request("/api/auth/signup", {
+      method: "POST",
+      headers: { "Content-Type": "text/plain" },
+      body: "not-json",
+    });
+    const crossOrigin = await request("/api/auth/signup", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Origin: "https://attacker.example" },
+      body: JSON.stringify({ email: "origin@example.com", password: "password123" }),
+    });
+    const oversized = await request("/api/auth/signup", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Content-Length": "40000" },
+      body: JSON.stringify({ email: "large@example.com", password: "password123" }),
+    });
+
+    // #then
+    expect(unauthenticated.response.headers.get("X-Request-Id")).toMatch(/^req_/);
+    expect(unauthenticated.body).toMatchObject({
+      error: { code: "UNAUTHENTICATED", request_id: unauthenticated.response.headers.get("X-Request-Id") },
+    });
+    expect(unsupported.response.status).toBe(415);
+    expect(crossOrigin.response.status).toBe(403);
+    expect(oversized.response.status).toBe(413);
+  });
+
+  it("rate limits repeated payment writes with a retry hint", async () => {
+    // #given
+    const cookie = await signup("payment-rate-limit@example.com");
+    const orderId = await createOrder(cookie);
+
+    // #when
+    const attempts = [];
+    for (let index = 0; index < 31; index += 1) {
+      attempts.push(await request(`/api/orders/${orderId}/payments`, {
+        method: "POST",
+        body: JSON.stringify({ amountCents: 1, paymentDate: "2026-08-14" }),
+      }, cookie));
+    }
+    const limited = attempts.at(-1);
+
+    // #then
+    expect(limited?.response.status).toBe(429);
+    expect(limited?.response.headers.get("Retry-After")).toMatch(/^\d+$/);
+    expect(limited?.body).toMatchObject({ error: { code: "RATE_LIMITED", retryable: true } });
+  });
+
+  it("creates a fresh owner-scoped demo scenario on every request", async () => {
+    // #given
+    const userACookie = await signup("demo-user-a@example.com");
+    const userBCookie = await signup("demo-user-b@example.com");
+
+    // #when
+    const first = await request<{ order: { id: string } }>("/api/demo", { method: "POST" }, userACookie);
+    const second = await request<{ order: { id: string } }>("/api/demo", { method: "POST" }, userACookie);
+    const userBOrders = await request<{ orders: Array<{ id: string }> }>("/api/orders", undefined, userBCookie);
+
+    // #then
+    expect(first.response.status).toBe(201);
+    expect(second.response.status).toBe(201);
+    const firstId = first.body && "data" in first.body ? first.body.data.order.id : undefined;
+    const secondId = second.body && "data" in second.body ? second.body.data.order.id : undefined;
+    expect(firstId).not.toBe(secondId);
+    expect(userBOrders.body).toMatchObject({ data: { orders: [] } });
+  });
+
+  it("exports only owner orders and neutralizes CSV formula prefixes", async () => {
+    // #given
+    const ownerCookie = await signup("csv-owner@example.com");
+    const otherCookie = await signup("csv-other@example.com");
+    await request("/api/orders", {
+      method: "POST",
+      body: JSON.stringify({
+        customer: "=SUM(A1:A2)",
+        dueDate: "2099-01-01",
+        items: [{ description: "Service", quantity: 1, unitPriceCents: 100 }],
+      }),
+    }, ownerCookie);
+    await createOrder(otherCookie);
+
+    // #when
+    const response = await app.request("/api/orders.csv", {
+      headers: { Cookie: ownerCookie },
+    }, env);
+    const csv = await response.text();
+
+    // #then
+    expect(response.status).toBe(200);
+    expect(csv).toContain("'=SUM(A1:A2)");
+    expect(csv).not.toContain("Acme Holdings");
+  });
+
+  it("soft deletes an unpaid order while preserving its audit history", async () => {
+    // #given
+    const cookie = await signup("soft-delete@example.com");
+    const orderId = await createOrder(cookie);
+
+    // #when
+    const deleted = await request(`/api/orders/${orderId}`, { method: "DELETE" }, cookie);
+    const detail = await request(`/api/orders/${orderId}`, undefined, cookie);
+    const auditCount = await env.DB.prepare(
+      "SELECT COUNT(*) AS count FROM audit_events WHERE order_id = ?",
+    )
+      .bind(orderId)
+      .first<{ count: number }>();
+
+    // #then
+    expect(deleted.response.status).toBe(204);
+    expect(detail.response.status).toBe(404);
+    expect(auditCount?.count).toBe(1);
   });
 });

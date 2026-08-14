@@ -1,104 +1,179 @@
 # Orders and Settlements
 
-A small multi-tenant finance operations application for creating customer orders, recording partial or full payments, and monitoring settlement status.
+[![CI](https://github.com/Achievengine/crossval-orders-settlements/actions/workflows/ci.yml/badge.svg)](https://github.com/Achievengine/crossval-orders-settlements/actions/workflows/ci.yml)
 
 **Live application:** https://crossval-orders-settlements.abenuteshome.workers.dev
 
+**Repository:** https://github.com/Achievengine/crossval-orders-settlements
+
+A multi-tenant finance operations application for creating orders, recording partial settlements, and protecting financial history under retries and concurrent writes.
+
+## 90-second reviewer path
+
+1. Sign up with any email and an eight-character password.
+2. Select **Load demo**. This creates a fresh order owned only by the current user: `2 × $500 = $1,000`, with a `$400` first payment.
+3. Confirm `partially_paid`, `$400` paid, and `$600` due.
+4. Select **Pay remaining balance**, then **Record payment**.
+5. Confirm `paid`, `$0` due, payment references, and the immutable audit timeline.
+6. Attempt another `$1`; the API returns the latest maximum allowed amount of `$0.00`.
+
+Every use of **Load demo** creates a new uniquely identified scenario. There is no shared demo account or cross-user seed data.
+
+## Why this assignment
+
+Orders and settlements is close to real B2B SaaS and finance operations work: tenant isolation, immutable financial history, partial payments, derived state, retry safety, database invariants, REST APIs, and an operational dashboard. It also maps directly to CrossVal's emphasis on reconciliation, auditability, correctness, and end-to-end production ownership.
+
+## Five engineering guarantees
+
+1. **Server-owned money:** clients send quantities and integer-cent unit prices; the Worker calculates every line and order total.
+2. **Tenant isolation:** every order, payment, audit, demo, and export query is scoped by the authenticated `user_id`; cross-user IDs return `404`.
+3. **Concurrent overpayment protection:** a D1 `BEFORE INSERT` trigger rejects any payment that would take the aggregate above the order total.
+4. **Idempotent payment writes:** retries with the same key and payload replay the original result; changing the payload returns `409 IDEMPOTENCY_KEY_REUSED`.
+5. **Immutable history:** orders lock after their first payment, and append-only audit events cannot be updated or deleted at the database layer.
+
 ## Architecture
 
-- **Frontend:** React 19, Vite, TypeScript, React Router, and plain responsive CSS.
-- **API:** A Hono REST API in the same Cloudflare Worker that serves the frontend.
-- **Database:** One isolated Cloudflare D1 database with foreign keys, checks, indexes, and payment/order triggers.
-- **Validation:** Zod validates all API input. Monetary totals are recalculated by the Worker.
-- **Authentication:** Email/password with PBKDF2-SHA-256, random per-user salts, and hashed random session tokens. The browser receives only a `Secure`, `HttpOnly`, `SameSite=Strict` cookie.
-- **Ownership:** Every order read or mutation includes the authenticated `user_id`. Cross-user order IDs return `404` rather than disclosing existence.
-
-Cloudflare static asset routing sends `/api/*` through the Worker first and serves all other paths from the Vite build with SPA fallback. No INSEAT service, database, bucket, secret, domain, or repository is used.
-
-## Local Setup
-
-Prerequisites: Node.js 20 or newer, npm, and a Cloudflare account when deploying.
-
-```bash
-npm install
-npm run cf-typegen
-npm run db:migrate:local
-npm run build
-npm run dev:worker
+```mermaid
+flowchart LR
+	B[React + Vite browser] -->|Secure HttpOnly session| W[Cloudflare Worker]
+	W -->|Static assets| A[Workers Assets]
+	W -->|Prepared statements and batches| D[(Cloudflare D1)]
+	D --> T[Overpayment and immutability triggers]
+	W --> L[Structured Worker logs]
+	G[GitHub Actions] -->|typecheck, tests, build| R[Public repository]
 ```
 
-The local Worker is available at `http://localhost:8787`. Vite-only UI development is available with `npm run dev`, but API flows require `npm run dev:worker`.
+One Worker serves the SPA and REST API. All requests pass through the Worker so CSP, HSTS, frame protection, referrer policy, permissions policy, and request IDs cover both HTML and API responses. D1 stores isolated assignment data only; no INSEAT infrastructure is used.
 
-## D1 Migrations
+## Database schema
 
-Create and bind an isolated database:
-
-```bash
-npx wrangler d1 create crossval-orders-settlements-db
+```mermaid
+erDiagram
+	USERS ||--o{ SESSIONS : owns
+	USERS ||--o{ ORDERS : owns
+	ORDERS ||--|{ ORDER_ITEMS : contains
+	ORDERS ||--o{ PAYMENTS : settles
+	USERS ||--o{ IDEMPOTENCY_RECORDS : scopes
+	PAYMENTS ||--o| IDEMPOTENCY_RECORDS : resolves_to
+	USERS ||--o{ AUDIT_EVENTS : owns
+	ORDERS ||--o{ AUDIT_EVENTS : records
 ```
 
-Copy the returned `database_id` into `wrangler.jsonc`, then run:
+Session tokens and idempotency keys are stored only as hashes. Passwords use random salts and PBKDF2 hashes.
 
-```bash
-npm run cf-typegen
-npm run db:migrate:local
-npm run db:migrate:remote
+## Status and payment state machine
+
+```mermaid
+stateDiagram-v2
+	[*] --> pending: order created
+	pending --> partially_paid: payment and due date not past
+	pending --> overdue: UTC due date passes
+	partially_paid --> overdue: UTC due date passes
+	partially_paid --> paid: payments equal total
+	overdue --> paid: payments equal total
 ```
 
-The committed deployment uses D1 database `2a0d3b6b-0e17-4776-8a27-4e597111aab4` in the separate `Abenuteshome@gmail.com` Cloudflare account.
+Paid takes precedence over overdue. A date-only due date is overdue only after that UTC calendar date passes.
 
-## API
-
-All responses use either `{ "data": ... }` or `{ "error": { "code", "message", "details"? } }`.
+## API endpoints
 
 | Method | Endpoint | Purpose |
 | --- | --- | --- |
-| `GET` | `/api/health` | Worker and D1 health |
-| `POST` | `/api/auth/signup` | Create an account and session |
-| `POST` | `/api/auth/login` | Authenticate and create a session |
-| `POST` | `/api/auth/logout` | Revoke the current session |
-| `GET` | `/api/auth/me` | Return the current user |
-| `GET` | `/api/orders?status=` | List owner-scoped orders; optionally filter status |
-| `POST` | `/api/orders` | Create an order and its line items atomically |
-| `GET` | `/api/orders/:orderId` | Return order detail, items, and payment history |
-| `PUT` | `/api/orders/:orderId` | Replace an unpaid order and its items atomically |
-| `DELETE` | `/api/orders/:orderId` | Delete an unpaid order |
-| `POST` | `/api/orders/:orderId/payments` | Record a partial or full payment |
+| `GET` | `/api/health` | D1 health and application version |
+| `POST` | `/api/auth/signup` | Atomic account and session creation |
+| `POST` | `/api/auth/login` | Authenticate and issue session |
+| `POST` | `/api/auth/logout` | Revoke current session |
+| `GET` | `/api/orders?status=` | Owner-scoped dashboard |
+| `GET` | `/api/orders.csv` | Owner-scoped formula-safe CSV |
+| `POST` | `/api/orders` | Atomic order, items, and audit event |
+| `GET` | `/api/orders/:orderId` | Detail, payments, and audit timeline |
+| `PUT/DELETE` | `/api/orders/:orderId` | Mutate or soft-delete an unpaid order only |
+| `POST` | `/api/orders/:orderId/payments` | Idempotent payment |
+| `POST` | `/api/demo` | Fresh owner-only canonical scenario |
 
-## Business Rules
+## Error envelope
 
-### Status derivation
-
-Status is derived at read time from the server-side order total, payment sum, due date, and current UTC date:
-
-1. `paid` when payments equal the order total. Paid takes precedence even when the due date is past.
-2. `overdue` when the due date is past and the order is not fully paid. This includes unpaid and partially paid orders.
-3. `partially_paid` when a non-overdue order has some payment but is not fully paid.
-4. `pending` when a non-overdue order has no payments.
-
-### Money policy
-
-All money is represented as integer cents in API payloads, TypeScript domain logic, and D1. For example, `$500.00` is `50000`. The Worker computes each `quantity * unit_price_cents` and the full order total; it never trusts a client-provided total. D1 also checks positive unit prices, positive payment amounts, integer quantities, and line total arithmetic.
-
-### Order immutability
-
-An order becomes read-only after its first payment. This prevents changing the commercial document beneath a settlement history. The API checks this rule for an actionable `409 ORDER_LOCKED` response, while D1 triggers independently reject order or line-item updates/deletes after payment.
-
-### Concurrency and overpayment
-
-The payment endpoint performs an early balance check to provide a useful maximum amount, but correctness does not rely on that read. The D1 `payments_prevent_overpayment` `BEFORE INSERT` trigger atomically aborts any insert where:
-
-```text
-SUM(existing payments) + NEW.amount_cents > order.total_cents
+```json
+{
+	"error": {
+		"code": "OVERPAYMENT",
+		"message": "Payment exceeds the remaining balance.",
+		"field": "amount",
+		"max_allowed_cents": 60000,
+		"request_id": "req_...",
+		"retryable": false
+	}
+}
 ```
 
-The Worker translates `PAYMENT_EXCEEDS_ORDER_BALANCE` into `409 OVERPAYMENT` with `details.maximumAmountCents`. Concurrent or rapid requests therefore cannot settle above the order total: the database serializes writes and the trigger evaluates each insert against committed payment state. The test suite and live deployment both submit competing final payments and verify exactly one succeeds.
+| Status | Meaning |
+| --- | --- |
+| `400` | Invalid JSON or idempotency key |
+| `401` | Missing or expired session |
+| `403` | Cross-origin write |
+| `404` | Unknown or non-owned resource |
+| `409` | Overpayment, lock, or idempotency conflict |
+| `413/415` | Body or content-type rejection |
+| `422` | Field-level validation details |
+| `429` | D1-backed limit plus `Retry-After` |
+| `500` | Sanitized internal failure |
 
-D1 `batch()` is used for related all-or-nothing writes: signup plus its initial session, order plus line items, and unpaid-order replacement.
+`X-Request-Id` matches the error-body request ID. SQL messages, traces, credentials, and internal identifiers are not exposed.
 
-## Testing and Validation
+## Idempotency contract
+
+Payment creation requires an opaque `Idempotency-Key` header.
+
+- The key is hashed and uniquely scoped by user plus operation.
+- A canonical payload hash covers order, amount, payment date, and note.
+- Same key and payload replays the stored `201` result with `Idempotency-Replayed: true`.
+- Same key and different payload returns `409 IDEMPOTENCY_KEY_REUSED`.
+- Payment and idempotency reservation commit in one D1 batch, so same-key races create one payment.
+- Assignment records persist for the database lifetime; production would expire them after a documented replay horizon.
+
+Idempotency and the overpayment trigger solve different failures. Duplicate `$400` requests both fit a `$1,000` balance, so only idempotency prevents duplication. Different `$600` keys racing against a `$600` balance are instead arbitrated by the trigger.
+
+## Concurrency invariant
+
+```text
+SUM(existing payments) + NEW.amount_cents <= order.total_cents
+```
+
+The early balance read exists for useful feedback, but correctness rests on `payments_prevent_overpayment`, a D1 `BEFORE INSERT` trigger. On conflict, the Worker re-reads the latest balance and returns the current maximum.
+
+The assignment rejects overpayment as a hard invariant. A production accounting platform might model customer credits, refunds, or credit notes. Those need additional accounting semantics and were deliberately excluded.
+
+## Tenant isolation and security
+
+- Random session cookies are `HttpOnly`, `Secure`, and `SameSite=Strict`; only token hashes reach D1.
+- Every resource, audit, export, and demo query uses authenticated ownership.
+- Cross-user IDs return `404` to avoid existence disclosure.
+- Same-origin writes are checked with `Origin` and `Sec-Fetch-Site`.
+- JSON bodies are limited to 32 KiB and validated with Zod caps.
+- Signup/login and payment writes use durable D1 rate-limit counters, not an in-memory map.
+- CSP, HSTS, `nosniff`, frame, referrer, and permissions policies cover the SPA and API.
+- CSV values beginning with `=`, `+`, `-`, or `@` are neutralized.
+
+## Indexes and query patterns
+
+| Index or constraint | Query served |
+| --- | --- |
+| Unique normalized `users.email` | Signup conflict and login |
+| Primary `sessions.id_hash` | Hashed session lookup |
+| `sessions.expires_at` | Session cleanup |
+| `orders(user_id, created_at DESC)` | Newest-first owner dashboard |
+| `orders(user_id, due_date)` | Owner due-date scans |
+| `orders(user_id, deleted_at, created_at DESC)` | Active-order dashboard after soft deletion |
+| `payments(order_id, payment_date DESC)` | Balance and payment timeline |
+| `audit_events(user_id, order_id, created_at)` | Owner audit timeline |
+| `(user_id, operation, key_hash)` primary key | Idempotency reservation |
+| `idempotency_records.created_at` | Retention cleanup |
+| `(scope_hash, action, window_started_at)` primary key | Rate-limit counter |
+
+## Test inventory
 
 ```bash
+npm ci
 npm run cf-typegen
 npm run typecheck
 npm test
@@ -106,48 +181,69 @@ npm run build
 npx wrangler deploy --dry-run
 ```
 
-Vitest runs inside the Cloudflare Workers runtime with an isolated D1 instance and the real migration. Coverage includes:
+Current result: **19 tests across 2 files** covering canonical settlement, money math, status and UTC boundaries, authentication and tenant isolation, order locking, concurrent overpayment, idempotent replay/mismatch/races/user scope, immutable audits, soft deletion with retained history, request IDs, security controls, rate limiting, isolated demos, and safe owner-only CSV.
 
-- `2 × $500 = $1,000` server-side total.
-- `$400` payment produces `partially_paid` and `$600` due.
-- A further `$600` produces `paid` and `$0` due.
-- A further `$1` is rejected with the maximum allowed amount.
-- Overdue unpaid, overdue partial, and fully paid past-due status precedence.
-- Unauthenticated rejection and cross-user isolation.
-- Editing rejected after the first payment.
-- Competing final payments cannot exceed the total.
+GitHub Actions runs install, Wrangler type generation, typecheck, tests, and build on pushes and pull requests.
 
-## Assumptions and Tradeoffs
-
-- USD is the only presentation currency; adding a per-order ISO currency code would be the next step for multi-currency use.
-- Dates are calendar dates (`YYYY-MM-DD`), and overdue comparison uses the Worker’s UTC date.
-- Passwords use PBKDF2-SHA-256 at the Workers runtime maximum of 100,000 iterations. A production system would prefer managed identity or benchmark a memory-hard Workers-compatible password service.
-- Sessions expire after seven days. There is no email verification, password reset, MFA, rate limiting, or account recovery in this take-home scope.
-- The dashboard fetches a bounded personal dataset without pagination. Cursor pagination and indexed server-side status/date filtering would be added for large tenants.
-- Deleting an unpaid order is supported by the API but intentionally omitted from the initial UI to keep the primary workflow direct and avoid accidental destructive action.
-
-## Before Production
-
-- Add rate limiting, email verification, password recovery, MFA, breached-password checks, and session management.
-- Add idempotency keys to payment creation for client retry safety, plus an append-only audit log.
-- Add currency, tenant/workspace membership, roles, and explicit timezone settings.
-- Add pagination, search, exports, reconciliation references, refunds, and payment-provider webhooks.
-- Add CSP and other security headers, dependency/secret scanning, CI deployment, preview environments, backups, alerts, and broader browser accessibility tests.
-- Replace external Google Fonts with a bundled font or a platform font stack to remove a third-party runtime dependency.
-
-## Deployment and Cleanup
-
-Deploy from the project directory:
+## Local setup
 
 ```bash
-npm run deploy
+cp .env.example .env
+npm install
+npm run cf-typegen
+npm run db:migrate:local
+npm run build
+npm run dev:worker
 ```
 
-Delete the assignment Worker and D1 database after review:
+No local secrets are required. Open `http://localhost:8787`.
+
+## Deployment and cleanup
+
+```bash
+npx wrangler d1 create crossval-orders-settlements-db
+npm run db:migrate:remote
+npm run deploy
+```
 
 ```bash
 npx wrangler delete crossval-orders-settlements
 npx wrangler d1 delete crossval-orders-settlements-db
 ```
 
-Both resources are standalone and can be removed without affecting any other service.
+## CrossVal production mapping
+
+| Assignment | CrossVal-style production mapping |
+| --- | --- |
+| D1 trigger | MongoDB transaction and invariant validation |
+| D1 idempotency table | Unique MongoDB idempotency index |
+| Audit events | Append-only audit collection or stream |
+| Worker logs | Structured AWS logs and CloudWatch alarms |
+| D1 migrations | Versioned production migration process |
+| Worker deployment | CI/CD-controlled AWS deployment |
+| D1 rate limits | Managed edge limiter or Redis/DynamoDB |
+
+In MongoDB, payment insertion, invariant validation, idempotency reservation, and event append would run in one transaction with unique indexes. Alerts would cover invariant failures, elevated `409/429/500` rates, latency, and reconciliation discrepancies.
+
+## Assumptions and production improvements
+
+- USD only; production needs ISO currency semantics.
+- UTC date-only due dates; production needs account timezone and business-day policy.
+- Assignment-scale unpaginated lists; production needs cursor pagination and indexed date/search filters.
+- D1 rate counters are durable and honest for this workload, but a managed edge limiter is better at scale.
+- Audit history persists; idempotency records need a documented production retention job.
+- Unpaid order deletion is a soft delete so immutable audit history and referential integrity remain intact.
+- Production financial corrections use reversal events, not edits.
+- Managed identity, MFA, roles, refunds, credits, provider webhooks, backups, recovery drills, alerts, SLOs, and reconciliation workflows remain production extensions.
+
+## Real-world references
+
+- **Stripe:** idempotent retries, amount remaining, payment history, and machine-readable errors.
+- **Modern Treasury:** immutable who/what/when event history.
+- **CrossVal:** reconciliation, auditability, financial correctness, and operator clarity.
+
+Stripe may model an overpayment as customer credit; this assignment rejects it because credit and refund semantics are outside scope.
+
+## AI-tool usage disclosure
+
+GitHub Copilot assisted with implementation, tests, documentation, and browser validation. Business rules were translated into database constraints and executable tests. Changes were typechecked, tested in the Workers runtime, built, dry-run deployed, exercised locally and live, and inspected with Chrome DevTools before publication.

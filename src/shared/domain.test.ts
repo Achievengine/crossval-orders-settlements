@@ -13,4 +13,13 @@ describe("order domain rules", () => {
     expect(deriveOrderStatus(100_000, 40_000, "2000-01-01", "2026-08-14")).toBe("overdue");
     expect(deriveOrderStatus(100_000, 100_000, "2000-01-01", "2026-08-14")).toBe("paid");
   });
+
+  it("treats a due date as overdue only after the UTC calendar date passes", () => {
+    // #given
+    const dueDate = "2026-08-14";
+
+    // #when / #then
+    expect(deriveOrderStatus(100_000, 0, dueDate, "2026-08-14")).toBe("pending");
+    expect(deriveOrderStatus(100_000, 0, dueDate, "2026-08-15")).toBe("overdue");
+  });
 });
