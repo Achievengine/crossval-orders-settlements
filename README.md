@@ -27,6 +27,12 @@ Every use of **Load demo** creates a new uniquely identified scenario. There is 
 
 Orders and settlements is close to real B2B SaaS and finance operations work: tenant isolation, immutable financial history, partial payments, derived state, retry safety, database invariants, REST APIs, and an operational dashboard. It also maps directly to CrossVal's emphasis on reconciliation, auditability, correctness, and end-to-end production ownership.
 
+## Business context
+
+CrossVal helps finance teams replace fragmented spreadsheets, manual reconciliation, and slow reporting with connected, reliable financial data. This assignment demonstrates a focused part of that problem: keeping customer orders, partial settlements, balances, and audit history accurate under retries and concurrent requests.
+
+This emphasis on correctness, auditability, and a single trustworthy view of financial state aligns with CrossVal's published [Yellow Branding case study](https://www.crossval.com/case-studies/yellow/) and its broader goal of freeing finance teams from low-value manual work.
+
 ## Five engineering guarantees
 
 1. **Server-owned money:** clients send quantities and integer-cent unit prices; the Worker calculates every line and order total.
