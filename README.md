@@ -10,6 +10,8 @@
 
 A multi-tenant finance operations application for creating orders, recording partial settlements, and protecting financial history under retries and concurrent writes.
 
+[![Orders and Settlements demo: load a partial order, settle the balance, and reject an overpayment](artifacts/crossval-orders-settlements.gif)](https://crossval.inseat.co)
+
 ## 90-second reviewer path
 
 1. Sign up with any email and an eight-character password.

@@ -5,6 +5,9 @@ dist/
 .env
 coverage/
 artifacts/
+!artifacts/
+artifacts/*
+!artifacts/crossval-orders-settlements.gif
 worker-configuration.d.ts
 *.tsbuildinfo
 *.log
