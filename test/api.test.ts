@@ -117,7 +117,7 @@ describe("orders and settlements API", () => {
       },
     });
     expect(overpayment.body && "error" in overpayment.body ? overpayment.body.error.message : "").toContain(
-      "maximum allowed amount is 0 cents",
+      "Maximum allowed: $0.00",
     );
   });
 

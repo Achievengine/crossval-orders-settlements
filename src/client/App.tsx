@@ -389,7 +389,11 @@ function OrderDetailPage() {
     const controller = new AbortController();
     setLoading(true);
     apiRequest<{ order: OrderDetail }>(`/api/orders/${orderId}`, { signal: controller.signal })
-      .then((result) => { setOrder(result.order); setError(""); })
+      .then((result) => {
+        setOrder(result.order);
+        setPaymentAmount((current) => current || (result.order.amountDueCents / 100).toFixed(2));
+        setError("");
+      })
       .catch((requestError: unknown) => {
         if (!(requestError instanceof DOMException && requestError.name === "AbortError")) setError(errorMessage(requestError));
       })

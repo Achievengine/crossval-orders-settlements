@@ -174,15 +174,37 @@ function apiError(
 }
 
 async function parseBody(context: AppContext): Promise<unknown> {
-  const body = await context.req.raw.arrayBuffer();
-  if (body.byteLength > MAX_REQUEST_BODY_BYTES) {
-    throw new ApiFailure(413, "REQUEST_TOO_LARGE", "Request body exceeds the 32 KiB limit.");
+  const reader = context.req.raw.body?.getReader();
+  if (!reader) {
+    throw new ApiFailure(400, "INVALID_JSON", "Request body must contain valid JSON.");
+  }
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    totalBytes += value.byteLength;
+    if (totalBytes > MAX_REQUEST_BODY_BYTES) {
+      await reader.cancel();
+      throw new ApiFailure(413, "REQUEST_TOO_LARGE", "Request body exceeds the 32 KiB limit.");
+    }
+    chunks.push(value);
+  }
+  const body = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
   }
   try {
     return JSON.parse(new TextDecoder().decode(body)) as unknown;
   } catch {
     throw new ApiFailure(400, "INVALID_JSON", "Request body must contain valid JSON.");
   }
+}
+
+function formatUsd(cents: number): string {
+  return `$${(cents / 100).toFixed(2)}`;
 }
 
 class ApiFailure extends Error {
@@ -357,6 +379,7 @@ app.use("*", async (context, next) => {
     status: context.res.status,
     durationMs: Date.now() - context.get("requestStartedAt"),
     userId: context.get("userId") || undefined,
+    orderId: context.req.path.match(/^\/api\/orders\/([0-9a-f-]{36})(?:\/|$)/)?.[1],
   }));
 });
 
@@ -858,7 +881,7 @@ app.post("/api/orders/:orderId/payments", async (context) => {
       context,
       409,
       "OVERPAYMENT",
-      `Payment exceeds the remaining balance. The maximum allowed amount is ${balance.amount_due_cents} cents.`,
+      `Payment exceeds the remaining balance. Maximum allowed: ${formatUsd(balance.amount_due_cents)}.`,
       { field: "amount", maxAllowedCents: balance.amount_due_cents },
     );
   }
@@ -901,7 +924,7 @@ app.post("/api/orders/:orderId/payments", async (context) => {
         context,
         409,
         "OVERPAYMENT",
-        `Payment exceeds the remaining balance. The maximum allowed amount is ${maximumAmountCents} cents.`,
+        `Payment exceeds the remaining balance. Maximum allowed: ${formatUsd(maximumAmountCents)}.`,
         { field: "amount", maxAllowedCents: maximumAmountCents },
       );
     }
