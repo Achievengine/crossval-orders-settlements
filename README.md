@@ -2,7 +2,9 @@
 
 [![CI](https://github.com/Achievengine/crossval-orders-settlements/actions/workflows/ci.yml/badge.svg)](https://github.com/Achievengine/crossval-orders-settlements/actions/workflows/ci.yml)
 
-**Live application:** https://crossval-orders-settlements.abenuteshome.workers.dev
+**Live application:** https://crossval.inseat.co
+
+**Fallback URL:** https://crossval-orders-settlements.abenuteshome.workers.dev
 
 **Repository:** https://github.com/Achievengine/crossval-orders-settlements
 
